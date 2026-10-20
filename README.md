@@ -13,6 +13,14 @@ It runs on Linux and macOS.
 
 ## Install
 
+Just:
+
+```sh
+curl -L "https://github.com/cordx56/dev-null-addict/releases/latest/download/dev-null-addict-$(uname -m)-$(uname -s).tar.gz" | tar xz -C "$HOME/.local/bin"
+```
+
+or:
+
 ```sh
 cargo install --path .
 ```

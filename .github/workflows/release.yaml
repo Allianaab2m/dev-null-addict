@@ -47,7 +47,7 @@ jobs:
           rustup install stable
           cargo build --release
           cd target/release
-          tar czf "dev-null-addict-$(rustc --print=host-tuple).tar.gz" dev-null-addict
+          tar czf "dev-null-addict-$(uname -m)-$(uname -s).tar.gz" dev-null-addict
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
         with:
