@@ -25,6 +25,7 @@ pub struct CommitList {
     loading_more: bool,
     first_page: Vec<CommitId>,
     paged: bool,
+    newest: Vec<CommitEntry>,
 }
 
 impl CommitList {
@@ -37,6 +38,7 @@ impl CommitList {
             loading_more: false,
             first_page: Vec::new(),
             paged: false,
+            newest: Vec::new(),
         }
     }
 
@@ -89,6 +91,36 @@ impl CommitList {
         }
         self.first_page = first_page;
         self.loaded = true;
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.loaded && self.next_cursor.is_none()
+    }
+
+    /// Collects newest-first pages until they overlap the loaded history, then
+    /// appends the collected replies oldest first without reopening old pagination.
+    pub fn refresh_newest(&mut self, page: Page<CommitEntry>, first: bool) -> Option<Cursor> {
+        if first {
+            self.newest.clear();
+        }
+        let overlap = page
+            .items
+            .iter()
+            .any(|entry| self.entries.iter().any(|old| old.id() == entry.id()));
+        self.newest.extend(page.items);
+        if !overlap && page.next_cursor.is_some() {
+            return page.next_cursor;
+        }
+        for entry in std::mem::take(&mut self.newest).into_iter().rev() {
+            if !visible(&entry) {
+                self.remove(entry.id());
+            } else if let Some(old) = self.entries.iter_mut().find(|old| old.id() == entry.id()) {
+                *old = entry;
+            } else {
+                self.entries.push(entry);
+            }
+        }
+        None
     }
 
     /// Adds the next page at the end.

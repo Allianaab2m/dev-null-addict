@@ -480,3 +480,176 @@ fn selection_and_counts_use_semantic_ansi_styles() {
 
 mod floating;
 mod scrolling;
+
+// A delayed rejection must receive its full display interval when the closed overlay reopens.
+#[test]
+fn unseen_rejection_waits_for_reopening() {
+    let mut app = app();
+    let now = Instant::now();
+    ready(&mut app, now);
+    app.pending.push(id(7));
+    app.input(UiInput::Toggle, now);
+    let mut rejected = commit(7);
+    rejected.status = crate::api::CommitStatus::Rejected;
+    app.answer(
+        Request::Moderation(id(7)),
+        Ok(Response::Thread(Thread {
+            ancestors: vec![],
+            commit: rejected,
+        })),
+        now,
+    );
+    let reopened = now + Duration::from_secs(60);
+    app.open(reopened);
+    assert!(
+        matches!(&app.popup, Some(Popup::Toast { message, until }) if message.contains("rejected") && *until == reopened + Popup::TOAST_TIME)
+    );
+    app.tick(reopened + Popup::TOAST_TIME);
+    assert!(app.popup.is_none());
+}
+
+// Plain 404 ends moderation polling; transient server errors must retain the pending commit.
+#[test]
+fn moderation_plain_404_is_final_but_server_failure_retries() {
+    for (status, retained) in [(404, false), (503, true), (429, true)] {
+        let mut app = app();
+        let now = Instant::now();
+        ready(&mut app, now);
+        app.pending.push(id(7));
+        app.answer(
+            Request::Moderation(id(7)),
+            Err(Failure::Api(ApiError::Status {
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                code: None,
+                message: "failure".into(),
+                retry_after: None,
+            })),
+            now,
+        );
+        assert_eq!(app.pending.contains(&id(7)), retained);
+        let effects = app.tick(now + Duration::from_secs(61));
+        assert_eq!(
+            effects.contains(&Effect::Send(Request::Moderation(id(7)))),
+            retained
+        );
+    }
+}
+
+// Exhausted replies must query the newest end, including bursts larger than a page, without duplicates or selection jumps.
+#[test]
+fn exhausted_replies_catch_up_from_newest_pages() {
+    let mut app = app();
+    let now = Instant::now();
+    ready(&mut app, now);
+    let mut view = ThreadView::new(id(1000));
+    view.set_thread(Thread {
+        ancestors: vec![],
+        commit: commit(1000),
+    });
+    view.refresh_replies(page(&(1..=50).collect::<Vec<_>>(), Some("second")));
+    view.replies_mut()
+        .append(page(&(51..=60).collect::<Vec<_>>(), None));
+    view.selection_mut()
+        .select(&(1..=60).map(id).collect::<Vec<_>>(), id(60));
+    app.threads.push(view);
+    let request = Request::NewestReplies {
+        id: id(1000),
+        cursor: None,
+    };
+    assert!(
+        app.tick(now + Duration::from_secs(5))
+            .contains(&Effect::Send(request.clone()))
+    );
+    app.answer(
+        request.clone(),
+        Ok(Response::Entries(page(
+            &(12..=61).rev().collect::<Vec<_>>(),
+            Some("older"),
+        ))),
+        now,
+    );
+    let view = app.threads.last().unwrap();
+    assert_eq!(
+        view.replies()
+            .entries()
+            .iter()
+            .map(CommitEntry::id)
+            .collect::<Vec<_>>(),
+        (1..=61).map(id).collect::<Vec<_>>()
+    );
+    assert_eq!(view.selection().id(), Some(id(60)));
+    assert!(view.replies().exhausted());
+    let next = Request::NewestReplies {
+        id: id(1000),
+        cursor: Some("catchup".to_owned().into()),
+    };
+    let effects = app.answer(
+        request.clone(),
+        Ok(Response::Entries(page(
+            &(82..=131).rev().collect::<Vec<_>>(),
+            Some("catchup"),
+        ))),
+        now,
+    );
+    assert_eq!(effects, vec![Effect::Send(next.clone())]);
+    assert!(
+        !app.tick(now + Duration::from_secs(10))
+            .contains(&Effect::Send(request.clone()))
+    );
+    app.answer(
+        next,
+        Ok(Response::Entries(page(
+            &(32..=81).rev().collect::<Vec<_>>(),
+            Some("older"),
+        ))),
+        now,
+    );
+    app.answer(
+        request,
+        Ok(Response::Entries(page(
+            &(82..=131).rev().collect::<Vec<_>>(),
+            Some("older"),
+        ))),
+        now,
+    );
+    assert_eq!(
+        app.threads
+            .last()
+            .unwrap()
+            .replies()
+            .entries()
+            .iter()
+            .map(CommitEntry::id)
+            .collect::<Vec<_>>(),
+        (1..=131).map(id).collect::<Vec<_>>()
+    );
+}
+
+// Multiple unseen rejections must survive unrelated errors and be shown one at a time after reopening.
+#[test]
+fn unseen_rejections_are_queued_behind_other_popups() {
+    let mut app = app();
+    let now = Instant::now();
+    for n in [7, 8] {
+        let mut rejected = commit(n);
+        rejected.status = crate::api::CommitStatus::Rejected;
+        app.answer(
+            Request::Moderation(id(n)),
+            Ok(Response::Thread(Thread {
+                ancestors: vec![],
+                commit: rejected,
+            })),
+            now,
+        );
+    }
+    app.popup = Some(Popup::toast("other error", now));
+    let reopened = now + Duration::from_secs(60);
+    app.open(reopened);
+    assert!(
+        matches!(&app.popup, Some(Popup::Toast {message, until}) if message.contains("0000007") && *until == reopened + Popup::TOAST_TIME)
+    );
+    app.input(UiInput::Key(Key::Esc), reopened);
+    assert!(
+        matches!(&app.popup, Some(Popup::Toast {message, until}) if message.contains("0000008") && *until == reopened + Popup::TOAST_TIME)
+    );
+}

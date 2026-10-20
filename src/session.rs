@@ -1,6 +1,9 @@
 //! The wrapper: the shell on a PTY, its input and output passed through, and
 //! the overlay on the toggle key.
 //!
+//! Before starting the input thread, startup asks once for CPR (up to 100 ms),
+//! seeds the model when answered, and retains any typeahead without clearing.
+//!
 //! One loop on a current-thread tokio runtime waits on everything at once:
 //! input (read by a thread of its own, since reading stdin cannot be
 //! cancelled), the shell's output, writes to the shell ([`InputQueue`]), the
@@ -25,6 +28,8 @@
 //!   sequence, opening waits for a boundary, at most
 //!   [`OutputFramer::BOUNDARY_TIMEOUT`](crate::screen::OutputFramer::BOUNDARY_TIMEOUT).
 //!   After that it writes CAN to the outer terminal and flushes the framer.
+//! - Replay close keeps incomplete output intact; redraw close waits for the
+//!   same boundary timeout as opening.
 //! - While the overlay is open, the framer holds partial sequences, and each
 //!   frame is either held for the replay ([`Overlay::hold`]) or, for a query,
 //!   answered: a local one from the model, straight to the shell, and any
@@ -48,6 +53,7 @@ mod input_queue;
 mod overlay;
 mod pending;
 mod requests;
+mod startup;
 
 use std::fmt;
 use std::io;
@@ -182,6 +188,14 @@ pub async fn run(options: SessionOptions) -> Result<ShellExit, SessionError> {
     let _raw = RawTerminal::enter().map_err(SessionError::Terminal)?;
     let (mut driver, mut answers) =
         driver::Driver::new(&options, size).map_err(SessionError::Terminal)?;
+    let startup::StartupInput {
+        position,
+        held: typeahead,
+    } = startup::cursor(&mut driver.display).map_err(SessionError::Terminal)?;
+    driver.seed_cursor(position);
+    driver
+        .input(&typeahead, Instant::now())
+        .map_err(SessionError::Terminal)?;
     let ShellProcess {
         mut output,
         mut input,

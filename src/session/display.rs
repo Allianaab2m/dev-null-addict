@@ -1,4 +1,4 @@
-use std::io::{self, Stdout};
+use std::io::{self, Write};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Frame, Terminal};
@@ -15,21 +15,37 @@ use crate::terminal::TermSize;
 /// when the overlay takes the screen over. It is not resized while the
 /// overlay is closed, since resizing clears the screen.
 pub struct Display {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<Output>>,
     size: TermSize,
+    #[cfg(test)]
+    captured: Option<std::rc::Rc<std::cell::RefCell<Vec<u8>>>>,
 }
 
 impl Display {
     pub fn new(size: TermSize) -> io::Result<Self> {
+        Self::with_output(size, Output::Terminal(io::stdout()))
+    }
+
+    fn with_output(size: TermSize, output: Output) -> io::Result<Self> {
+        #[cfg(test)]
+        let captured = match &output {
+            Output::Capture(bytes) => Some(bytes.clone()),
+            _ => None,
+        };
         let terminal = Terminal::with_options(
-            CrosstermBackend::new(std::io::stdout()),
+            CrosstermBackend::new(output),
             ratatui::TerminalOptions {
                 viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(
                     0, 0, size.cols, size.rows,
                 )),
             },
         )?;
-        Ok(Self { terminal, size })
+        Ok(Self {
+            terminal,
+            size,
+            #[cfg(test)]
+            captured,
+        })
     }
 
     pub(super) fn size(&self) -> TermSize {
@@ -66,5 +82,44 @@ impl Display {
 
     pub fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
         self.terminal.draw(render).map(|_| ())
+    }
+}
+
+enum Output {
+    Terminal(io::Stdout),
+    #[cfg(test)]
+    Capture(std::rc::Rc<std::cell::RefCell<Vec<u8>>>),
+}
+
+impl Write for Output {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Terminal(output) => output.write(bytes),
+            #[cfg(test)]
+            Self::Capture(output) => output.borrow_mut().write(bytes),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Terminal(output) => output.flush(),
+            #[cfg(test)]
+            Self::Capture(_) => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Display {
+    pub(super) fn captured(size: TermSize) -> Self {
+        Self::with_output(size, Output::Capture(std::rc::Rc::default())).unwrap()
+    }
+    pub(super) fn take_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(
+            &mut *self
+                .captured
+                .as_ref()
+                .expect("capture required")
+                .borrow_mut(),
+        )
     }
 }

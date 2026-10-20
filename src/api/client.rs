@@ -131,6 +131,21 @@ impl Client {
         .await
     }
 
+    /// A page of replies newest first, for catching up an exhausted thread.
+    pub async fn newest_replies(
+        &self,
+        id: CommitId,
+        cursor: Option<&Cursor>,
+    ) -> Result<Page<CommitEntry>, ApiError> {
+        self.request(
+            "GET",
+            &format!("/api/v1/commits/{id}/replies?newest=1"),
+            cursor,
+            None,
+        )
+        .await
+    }
+
     /// Returns the new commit, pending review unless the user is an admin.
     pub async fn create_commit(&self, commit: &NewCommit) -> Result<Commit, ApiError> {
         self.data(

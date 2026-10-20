@@ -12,6 +12,10 @@ pub struct PendingOutput {
 impl PendingOutput {
     pub const LIMIT: usize = 4 << 20;
 
+    pub fn replayable(&self) -> bool {
+        !self.overflowed
+    }
+
     pub fn push(&mut self, bytes: &[u8]) {
         if !self.overflowed {
             if self.bytes.len().saturating_add(bytes.len()) > Self::LIMIT {

@@ -100,6 +100,10 @@ async fn execute(client: &Client, request: &Request) -> Result<Response, crate::
             .replies(*id, cursor.as_ref())
             .await
             .map(Response::Entries),
+        Request::NewestReplies { id, cursor } => client
+            .newest_replies(*id, cursor.as_ref())
+            .await
+            .map(Response::Entries),
         Request::Create(commit) => client.create_commit(commit).await.map(Response::Commit),
         Request::Delete(id) => client.delete_commit(*id).await.map(|()| Response::Done),
         Request::Star { id, starred } => client.set_star(*id, *starred).await.map(Response::Commit),

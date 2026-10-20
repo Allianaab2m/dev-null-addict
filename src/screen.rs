@@ -55,6 +55,15 @@ pub trait ScreenModel {
     /// changes the screen.
     fn restore(&self) -> Vec<u8>;
 
+    /// Restores modes and SGR without reconstructing the cursor or its wrap cell.
+    fn restore_modes(&self) -> Vec<u8>;
+
+    /// Whether the application has populated the main buffer's DECSC slot.
+    fn has_saved_cursor(&self) -> bool;
+
+    /// Reconstructs both buffers, their saved cursors and the active buffer.
+    fn redraw_all(&self) -> Vec<u8>;
+
     /// Answers a query of [`QueryKind::is_local`] the way the terminal would
     /// at this point of the output, from the copy rather than from the outer
     /// terminal, whose cursor and modes the overlay has changed. `None` if

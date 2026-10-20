@@ -647,6 +647,7 @@ dependencies = [
  "gethostname",
  "getrandom 0.4.3",
  "jiff",
+ "libc",
  "pty-process",
  "ratatui",
  "ratatui-textarea",

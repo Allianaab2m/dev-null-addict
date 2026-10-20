@@ -13,7 +13,7 @@ pub struct Vt100Screen {
     handled: vte::Parser,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ModeCallbacks {
     modes: ExtraModes,
 }
@@ -46,6 +46,7 @@ struct HandledModes<'a> {
     buffer: Buffer,
     rows: u16,
     completed: &'a mut bool,
+    replacement: &'a mut Option<Vec<u8>>,
 }
 
 // vt100 handles these sequences without callbacks, but does not expose their state.
@@ -87,19 +88,59 @@ impl vte::Perform for HandledModes<'_> {
             }
             (b" ", 'q') => self.modes.csi(self.buffer, intermediates, &params, action),
             (b"?", 'h' | 'l') => {
-                let handled: Vec<_> = params
-                    .into_iter()
-                    .filter(|p| p.first() == Some(&6))
-                    .collect();
-                self.modes.csi(self.buffer, intermediates, &handled, action);
+                let mut buffer = self.buffer;
+                let mut normalized = Vec::new();
+                for param in params {
+                    match param {
+                        [6] => self.modes.csi(buffer, b"?", &[param], action),
+                        [1049] if action == 'h' => {
+                            self.modes.save_cursor(buffer);
+                            self.modes.clear_alternate();
+                            buffer = Buffer::Alternate;
+                        }
+                        [1049] => {
+                            buffer = Buffer::Main;
+                            self.modes.restore_cursor(buffer);
+                        }
+                        [47 | 1047] => {
+                            if param == [1047] && action == 'l' && buffer == Buffer::Alternate {
+                                normalized.extend_from_slice(b"\x1b[2J");
+                            }
+                            buffer = if action == 'h' {
+                                Buffer::Alternate
+                            } else {
+                                Buffer::Main
+                            };
+                        }
+                        _ => {}
+                    }
+                    let parameter = if param == [1047] {
+                        "47".to_owned()
+                    } else {
+                        param
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(":")
+                    };
+                    normalized.extend_from_slice(format!("\x1b[?{parameter}{action}").as_bytes());
+                }
+                // vt100 callbacks receive the entire list for each unhandled mode.
+                // Feed single modes in order so 1047's clear happens on the right buffer.
+                *self.replacement = Some(normalized);
             }
             _ => {}
         }
     }
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         *self.completed = true;
-        if !ignore && intermediates.is_empty() && byte == b'c' {
-            *self.modes = ExtraModes::default();
+        if !ignore && intermediates.is_empty() {
+            match byte {
+                b'c' => *self.modes = ExtraModes::default(),
+                b'7' => self.modes.save_cursor(self.buffer),
+                b'8' => self.modes.restore_cursor(self.buffer),
+                _ => {}
+            }
         }
     }
 }
@@ -124,21 +165,28 @@ impl ScreenModel for Vt100Screen {
 
     fn process(&mut self, bytes: &[u8]) {
         for byte in bytes {
-            self.parser.process(std::slice::from_ref(byte));
             let buffer = self.buffer();
             let (rows, cols) = self.parser.screen().size();
             let mut completed = false;
+            let mut replacement = None;
             self.handled.advance(
                 &mut HandledModes {
                     modes: &mut self.parser.callbacks_mut().modes,
                     buffer,
                     rows: rows.get(),
                     completed: &mut completed,
+                    replacement: &mut replacement,
                 },
                 std::slice::from_ref(byte),
             );
+            if let Some(normalized) = replacement {
+                self.parser.process(b"\x18");
+                self.parser.process(&normalized);
+            } else {
+                self.parser.process(std::slice::from_ref(byte));
+            }
             if completed
-                && self.parser.callbacks().modes.mode(7) == Some(false)
+                && self.parser.callbacks().modes.mode(buffer, 7) == Some(false)
                 && self.parser.screen().cursor_position().1 >= cols.get()
             {
                 self.parser.process(b"\x08");
@@ -164,11 +212,44 @@ impl ScreenModel for Vt100Screen {
 
     fn restore(&self) -> Vec<u8> {
         let screen = self.parser.screen();
+        let mut out = self.restore_modes();
+        out.extend(cursor_restore(
+            screen,
+            &self.parser.callbacks().modes,
+            self.buffer(),
+        ));
+        out.extend_from_slice(screen.attributes_formatted().as_bytes());
+        out
+    }
+
+    fn restore_modes(&self) -> Vec<u8> {
+        let screen = self.parser.screen();
         let mut out = b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l".to_vec();
         out.extend_from_slice(screen.input_mode_formatted().as_bytes());
         out.extend(self.parser.callbacks().modes.restore(self.buffer()));
-        out.extend(cursor_restore(screen, &self.parser.callbacks().modes));
         out.extend_from_slice(screen.attributes_formatted().as_bytes());
+        out
+    }
+
+    fn has_saved_cursor(&self) -> bool {
+        self.parser.callbacks().modes.saved_cursor[0]
+    }
+
+    fn redraw_all(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for buffer in [Buffer::Main, Buffer::Alternate] {
+            let copy = self.copy_buffer(buffer);
+            out.extend_from_slice(buffer_switch(buffer));
+            out.extend_from_slice(super::BASELINE);
+            out.extend(copy.redraw());
+            let mut saved = copy.copy_buffer(buffer);
+            saved.process(b"\x1b8");
+            out.extend(saved.restore());
+            out.extend_from_slice(b"\x1b7");
+            out.extend(copy.restore());
+        }
+        out.extend_from_slice(buffer_switch(self.buffer()));
+        out.extend(self.restore());
         out
     }
 
@@ -186,7 +267,7 @@ impl ScreenModel for Vt100Screen {
                         } else {
                             ""
                         },
-                        modes.cursor_row(row) + 1,
+                        modes.cursor_row(self.buffer(), row) + 1,
                         col.min(screen.size().1.get() - 1) + 1
                     )
                     .into_bytes(),
@@ -203,7 +284,7 @@ impl ScreenModel for Vt100Screen {
                 let private = text.starts_with('?');
                 let number: u16 = text.trim_start_matches('?').parse().ok()?;
                 let value = if private {
-                    modes.mode(number).or_else(|| match number {
+                    modes.mode(self.buffer(), number).or_else(|| match number {
                         1 => Some(screen.application_cursor()),
                         25 => Some(!screen.hide_cursor()),
                         47 | 1047 | 1049 => Some(screen.alternate_screen()),
@@ -338,7 +419,7 @@ mod tests {
     }
 }
 
-fn cursor_restore(screen: &vt100::Screen, modes: &ExtraModes) -> Vec<u8> {
+fn cursor_restore(screen: &vt100::Screen, modes: &ExtraModes, buffer: Buffer) -> Vec<u8> {
     let cursor = screen.cursor_state_formatted();
     let mut out = Vec::new();
     let mut pos = 0;
@@ -364,7 +445,7 @@ fn cursor_restore(screen: &vt100::Screen, modes: &ExtraModes) -> Vec<u8> {
                     .unwrap_or(1)
                     .max(1);
                 out.extend_from_slice(
-                    format!("\x1b[{};{col}H", modes.cursor_row(row - 1) + 1).as_bytes(),
+                    format!("\x1b[{};{col}H", modes.cursor_row(buffer, row - 1) + 1).as_bytes(),
                 );
             } else {
                 out.extend_from_slice(&rest[..=end]);
@@ -457,5 +538,107 @@ mod text_tests {
         screen.resize(TermSize { cols: 12, rows: 5 });
         assert_eq!(screen.text_rows().len(), 5);
         assert_eq!(screen.text_rows()[0], "A界B e\u{301}");
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    // DECRC restores origin mode too, so hidden CPR must remain relative to the margins.
+    #[test]
+    fn saved_origin_mode_controls_hidden_cpr() {
+        let mut screen = Vt100Screen::new(TermSize { cols: 80, rows: 24 });
+        screen.process(b"\x1b[2;20r\x1b[?6h\x1b7\x1b[?6l\x1b8");
+        assert_eq!(
+            screen.answer(QueryKind::CursorPosition, b"\x1b[6n"),
+            Some(b"\x1b[1;1R".to_vec())
+        );
+        assert_eq!(
+            screen.answer(QueryKind::Mode, b"\x1b[?6$p"),
+            Some(b"\x1b[?6;1$y".to_vec())
+        );
+    }
+
+    // Exhausting a kitty stack resets even an assigned base, without affecting the other buffer.
+    #[test]
+    fn kitty_underflow_resets_assigned_flags() {
+        let mut screen = Vt100Screen::new(TermSize { cols: 80, rows: 24 });
+        screen.process(b"\x1b[=3u\x1b[<999u");
+        assert_eq!(
+            screen.answer(QueryKind::KeyboardFlags, b"\x1b[?u"),
+            Some(b"\x1b[?0u".to_vec())
+        );
+    }
+
+    // Compound mode lists must apply 1047 at its position, without clearing main or resetting a later switch.
+    #[test]
+    fn compound_1047_modes_keep_sequence_order() {
+        let mut screen = Vt100Screen::new(TermSize { cols: 80, rows: 24 });
+        screen.process(b"MAIN\x1b[?1047;1004hALT\x1b[?1047;47;1004l");
+        assert_eq!(screen.buffer(), Buffer::Main);
+        assert_eq!(screen.text_rows()[0], "MAIN");
+        screen.process(b"\x1b[?47h");
+        assert!(screen.text_rows().iter().all(String::is_empty));
+        screen.process(b"\x1b[?47;6;1047h");
+        assert_eq!(
+            screen.answer(QueryKind::Mode, b"\x1b[?6$p"),
+            Some(b"\x1b[?6;1$y".to_vec())
+        );
+    }
+
+    // Reentering 1049 clears the alternate origin state; the main saved origin still governs the later return.
+    #[test]
+    fn saved_origin_tracks_buffer_return_and_alternate_reset() {
+        let mut screen = Vt100Screen::new(TermSize { cols: 80, rows: 24 });
+        screen.process(b"\x1b[2;20r\x1b[?6h\x1b[3;4H\x1b[?1049h\x1b[4;18r\x1b[?6h\x1b7\x1b[?1049l");
+        assert_eq!(
+            screen.answer(QueryKind::CursorPosition, b"\x1b[6n"),
+            Some(b"\x1b[3;4R".to_vec())
+        );
+        screen.process(b"\x1b[?1049h\x1b[5;6H");
+        assert_eq!(
+            screen.answer(QueryKind::CursorPosition, b"\x1b[6n"),
+            Some(b"\x1b[5;6R".to_vec())
+        );
+        assert_eq!(
+            screen.answer(QueryKind::Mode, b"\x1b[?6$p"),
+            Some(b"\x1b[?6;2$y".to_vec())
+        );
+    }
+
+    // 1047 clears alternate contents on exit, but preserves main contents and its saved cursor.
+    #[test]
+    fn mode_1047_switches_and_clears_on_exit() {
+        let mut screen = Vt100Screen::new(TermSize { cols: 80, rows: 24 });
+        screen.process(b"MAIN\x1b7\x1b[?1047hALT");
+        assert_eq!(screen.buffer(), Buffer::Alternate);
+        assert!(screen.text_rows()[0].contains("ALT"));
+        screen.process(b"\x1b[?1047l\x1b8");
+        assert_eq!(screen.buffer(), Buffer::Main);
+        assert_eq!(screen.text_rows()[0], "MAIN");
+        screen.process(b"\x1b[?47h");
+        assert!(screen.text_rows().iter().all(String::is_empty));
+    }
+}
+
+impl Vt100Screen {
+    fn copy_buffer(&self, buffer: Buffer) -> Self {
+        let (rows, cols) = self.parser.screen().size();
+        let mut copy = Self::new(TermSize {
+            rows: rows.get(),
+            cols: cols.get(),
+        });
+        *copy.parser.screen_mut() = self.parser.screen().clone();
+        *copy.parser.callbacks_mut() = self.parser.callbacks().clone();
+        copy.process(buffer_switch(buffer));
+        copy
+    }
+}
+
+fn buffer_switch(buffer: Buffer) -> &'static [u8] {
+    match buffer {
+        Buffer::Main => b"\x1b[?47l",
+        Buffer::Alternate => b"\x1b[?47h",
     }
 }

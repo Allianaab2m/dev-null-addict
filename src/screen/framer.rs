@@ -61,8 +61,8 @@ impl OutputFramer {
     pub const MAX_SEQUENCE: usize = 4096;
 
     /// How long the overlay waits for the output to reach a boundary before
-    /// it opens anyway. It then cancels the partial sequence on the outer
-    /// terminal with CAN.
+    /// opening or redrawing on close anyway. Opening cancels the partial
+    /// sequence on the outer terminal; redraw close cancels it in the model.
     pub const BOUNDARY_TIMEOUT: Duration = Duration::from_millis(50);
 
     pub fn new() -> Self {

@@ -27,10 +27,9 @@ use super::pending::PendingOutput;
 ///   resized meanwhile. The overlay leaves the alternate screen, sets the
 ///   shell's modes as they were when it opened, and replays the output,
 ///   which brings the terminal to where the shell is now.
-/// - Otherwise the screen is drawn from the copy. The overlay switches the
-///   outer terminal to the buffer the shell is on now (the shell may have
-///   switched while hidden), sets [`BASELINE`](crate::screen::BASELINE),
-///   draws [`ScreenModel::redraw`], then sets [`ScreenModel::restore`].
+/// - Otherwise both buffers, their saved cursors and the active buffer are
+///   reconstructed with [`ScreenModel::redraw_all`]. The driver waits for an
+///   output boundary before this path.
 pub struct Overlay {
     app: App,
     decoder: KeyDecoder,
@@ -46,7 +45,7 @@ struct Takeover {
     /// overlay opened.
     shell_buffer: Buffer,
     entered_alternate: bool,
-    /// [`ScreenModel::restore`] when the overlay opened, set before a replay.
+    /// Buffer and mode restoration captured on opening, preceding replay.
     shell_modes: Vec<u8>,
     /// Set by a resize while open, which rules out a replay.
     resized: bool,
@@ -81,16 +80,25 @@ impl Overlay {
         }
         let shell_buffer = screen.buffer();
         let entered_alternate = shell_buffer == Buffer::Main;
-        let shell_modes = screen.restore();
-        let mut cleanup = Vec::new();
+        let preserve_saved_cursor = screen.has_saved_cursor();
+        let mut shell_modes = Vec::new();
         if entered_alternate {
-            cleanup.extend_from_slice(b"\x1b[?1049l");
+            shell_modes.extend_from_slice(b"\x1b[?47l");
+            shell_modes.extend(if preserve_saved_cursor {
+                screen.restore()
+            } else {
+                screen.restore_modes()
+            });
+            if !preserve_saved_cursor {
+                // Restore modes before DECRC, which knows the real cursor even without startup CPR.
+                shell_modes.extend_from_slice(b"\x1b[?47h\x1b[?1049l");
+            }
         }
-        cleanup.extend_from_slice(crate::screen::BASELINE);
-        if !entered_alternate {
-            cleanup.extend(screen.redraw());
-        }
-        cleanup.extend_from_slice(&shell_modes);
+        let cleanup = if entered_alternate {
+            shell_modes.clone()
+        } else {
+            screen.redraw_all()
+        };
         crate::terminal::set_cleanup(Some(cleanup));
         self.takeover = Some(Takeover {
             shell_buffer,
@@ -99,7 +107,12 @@ impl Overlay {
             resized: false,
         });
         if entered_alternate {
-            display.write(b"\x1b[?1049h")?;
+            // Mode 47 does not overwrite an application's DECSC slot.
+            display.write(if preserve_saved_cursor {
+                b"\x1b[?47h"
+            } else {
+                b"\x1b[?1049h"
+            })?;
         }
         display.write(crate::screen::BASELINE)?;
         display.write(b"\x1b[=0u\x1b[>4;0m\x1b[?1l\x1b>\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?2004h\x1b[0 q")?;
@@ -126,16 +139,10 @@ impl Overlay {
         };
         let replay = self.pending.take();
         if takeover.entered_alternate && !takeover.resized && replay.is_some() {
-            display.write(b"\x1b[?1049l")?;
             display.write(&takeover.shell_modes)?;
             display.write(replay.as_deref().unwrap_or_default())?;
         } else {
-            if screen.buffer() == Buffer::Main {
-                display.write(b"\x1b[?1049l")?;
-            }
-            display.write(crate::screen::BASELINE)?;
-            display.write(&screen.redraw())?;
-            display.write(&screen.restore())?;
+            display.write(&screen.redraw_all())?;
         }
         self.takeover = None;
         self.redraw = redraw::Redraw::default();
@@ -146,9 +153,19 @@ impl Overlay {
         Ok(self.decoder.take_rest())
     }
 
+    pub fn can_replay(&self) -> bool {
+        self.takeover.as_ref().is_some_and(|takeover| {
+            takeover.entered_alternate && !takeover.resized && self.pending.replayable()
+        })
+    }
+
     /// Input while open, to be taken with [`next_input`](Self::next_input).
     pub fn push_input(&mut self, bytes: &[u8], now: Instant) {
         self.decoder.push(bytes, now);
+    }
+
+    pub fn take_input(&mut self) -> Vec<u8> {
+        self.decoder.take_rest()
     }
 
     pub fn next_input(&mut self, now: Instant) -> Option<Decoded> {

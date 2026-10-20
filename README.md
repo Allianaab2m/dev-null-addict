@@ -144,7 +144,10 @@ are show down its right edge.
 - Under each commit are its stars and replies. The stars count turns yellow
   and gets a `*` once you have starred it.
 - Your new commits appear once they are approved. If one is rejected, a
-  message says so.
+  message says so. Rejections received while closed wait until you reopen;
+  each notice then stays for five seconds.
+- Once all replies in a thread are loaded, refreshes append new replies in
+  chronological order.
 - Errors show up in a popup that goes away by itself.
 
 ## Options
@@ -156,8 +159,13 @@ You can get option list by passing `--help` to command arguments.
 - dev-null-addict sees only the terminal it runs in, not other windows.
 - A lone Esc reaches the shell 10 ms later, while dev-null-addict waits to see
   whether the toggle key follows in an escape sequence.
+- Startup asks for the cursor position once, waiting up to 100 ms without
+  clearing existing output. If the terminal does not answer, the screen copy
+  starts unsynchronized.
 - What the shell prints while /dev/null is open is replayed when it closes.
   Past 4 MiB of it, the screen is redrawn instead, and the lines that
-  scrolled off are not in the terminal's scrollback.
+  scrolled off are not in the terminal's scrollback. Redraw restores both
+  screen buffers and waits up to 50 ms for an incomplete output sequence;
+  replay preserves such sequences across closing.
 - /dev/null allows 120 signed requests a minute per user, across all your
   terminals, and 10 commits a minute.

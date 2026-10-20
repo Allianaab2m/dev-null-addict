@@ -19,6 +19,7 @@ pub(super) struct Driver {
     scanner: ToggleScanner,
     gate: ToggleGate,
     opening: Option<(Instant, Vec<u8>)>,
+    closing: Option<Instant>,
 }
 
 impl Driver {
@@ -40,13 +41,23 @@ impl Driver {
                 scanner: ToggleScanner::new(options.toggle),
                 gate: ToggleGate::new(),
                 opening: None,
+                closing: None,
             },
             answers,
         ))
     }
 
+    pub fn seed_cursor(&mut self, position: Option<(u16, u16)>) {
+        if let Some((row, col)) = position {
+            self.screen
+                .process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        }
+    }
+
     pub fn input(&mut self, bytes: &[u8], now: Instant) -> io::Result<()> {
-        if let Some((_, held)) = &mut self.opening {
+        if self.closing.is_some() {
+            self.queue.push(bytes);
+        } else if let Some((_, held)) = &mut self.opening {
             held.extend_from_slice(bytes);
         } else if self.overlay.is_open() {
             self.overlay.push_input(bytes, now);
@@ -60,7 +71,8 @@ impl Driver {
     }
 
     fn scanned(&mut self, pieces: Vec<Scanned>, now: Instant) -> io::Result<()> {
-        for piece in pieces {
+        let mut pieces = pieces.into_iter();
+        while let Some(piece) = pieces.next() {
             if self.opening.is_some() || self.overlay.is_open() {
                 let raw = match piece {
                     Scanned::Forward(raw) | Scanned::Toggle { raw, .. } => raw,
@@ -68,7 +80,19 @@ impl Driver {
                 self.input(&raw, now)?;
             } else {
                 let action = self.gate.handle(piece, now);
-                self.gate_action(action, now)?;
+                if let GateAction::Open(mut raw) = action {
+                    // Complete scanner pieces precede its held tail, even when this piece opens the UI.
+                    for piece in pieces.by_ref() {
+                        match piece {
+                            Scanned::Forward(bytes) | Scanned::Toggle { raw: bytes, .. } => {
+                                raw.extend(bytes)
+                            }
+                        }
+                    }
+                    self.gate_action(GateAction::Open(raw), now)?;
+                } else {
+                    self.gate_action(action, now)?;
+                }
             }
         }
         if self.opening.is_some() || self.overlay.is_open() {
@@ -81,7 +105,8 @@ impl Driver {
     fn gate_action(&mut self, action: GateAction, now: Instant) -> io::Result<()> {
         match action {
             GateAction::Forward(raw) => self.queue.push(&raw),
-            GateAction::Open(raw) => {
+            GateAction::Open(mut raw) => {
+                raw.extend(self.scanner.take_held());
                 self.opening = Some((now + OutputFramer::BOUNDARY_TIMEOUT, raw));
                 self.try_open(now)?;
             }
@@ -104,13 +129,13 @@ impl Driver {
         }
         let (_, raw) = self.opening.take().expect("opening is pending");
         let effects = self.overlay.open(&mut self.display, &self.screen, now)?;
-        self.effects(effects)?;
+        self.effects(effects, now)?;
         self.overlay.push_input(&raw, now);
         self.decode(now)
     }
 
     fn decode(&mut self, now: Instant) -> io::Result<()> {
-        while self.overlay.is_open() {
+        while self.overlay.is_open() && self.closing.is_none() {
             let Some(decoded) = self.overlay.next_input(now) else {
                 break;
             };
@@ -118,7 +143,7 @@ impl Driver {
                 Decoded::Reply(raw) => self.queue.push(&raw),
                 Decoded::Input(input) => {
                     let effects = self.overlay.app_mut().input(input, now);
-                    self.effects(effects)?;
+                    self.effects(effects, now)?;
                 }
             }
         }
@@ -129,7 +154,8 @@ impl Driver {
         let mut frames = Vec::new();
         self.framer.push(bytes, self.overlay.is_open(), &mut frames);
         self.frames(frames)?;
-        self.try_open(now)
+        self.try_open(now)?;
+        self.try_close(now)
     }
 
     fn frames(&mut self, frames: Vec<Frame>) -> io::Result<()> {
@@ -158,10 +184,10 @@ impl Driver {
         Ok(())
     }
 
-    fn effects(&mut self, effects: Vec<Effect>) -> io::Result<()> {
+    fn effects(&mut self, effects: Vec<Effect>, now: Instant) -> io::Result<()> {
         for effect in effects {
             match effect {
-                Effect::Close => self.close()?,
+                Effect::Close => self.request_close(now)?,
                 Effect::Send(request) => self.requests.send(request),
             }
         }
@@ -169,18 +195,44 @@ impl Driver {
     }
 
     pub fn close(&mut self) -> io::Result<()> {
-        if !self.overlay.is_open() {
-            return Ok(());
+        let now = Instant::now();
+        self.request_close(now)?;
+        self.try_close(now + OutputFramer::BOUNDARY_TIMEOUT)
+    }
+
+    fn request_close(&mut self, now: Instant) -> io::Result<()> {
+        if self.overlay.is_open() {
+            self.closing
+                .get_or_insert(now + OutputFramer::BOUNDARY_TIMEOUT);
         }
-        if !self.framer.at_boundary() {
+        self.try_close(now)?;
+        if self.closing.is_some() {
+            let rest = self.overlay.take_input();
+            self.queue.push(&rest);
+        }
+        Ok(())
+    }
+
+    fn try_close(&mut self, now: Instant) -> io::Result<()> {
+        let Some(deadline) = self.closing else {
+            return Ok(());
+        };
+        if !self.overlay.can_replay() && !self.framer.at_boundary() {
+            if now < deadline {
+                return Ok(());
+            }
             let mut frames = Vec::new();
             self.framer.flush(&mut frames);
             self.frames(frames)?;
             self.screen.process(b"\x18");
-            self.overlay.hold(b"\x18");
         }
         let rest = self.overlay.close(&mut self.display, &self.screen)?;
-        self.input(&rest, Instant::now())
+        self.closing = None;
+        // Deliver a replay tail only after returning the screen, retaining the parser state.
+        let mut frames = Vec::new();
+        self.framer.push(&[], false, &mut frames);
+        self.frames(frames)?;
+        self.input(&rest, now)
     }
 
     pub fn resize(&mut self, size: TermSize) -> io::Result<()> {
@@ -199,7 +251,7 @@ impl Driver {
             .overlay
             .app_mut()
             .answer(answer.request, answer.result, now);
-        self.effects(effects)
+        self.effects(effects, now)
     }
 
     pub fn deadline(&self) -> Option<Instant> {
@@ -207,6 +259,7 @@ impl Driver {
             .deadline()
             .into_iter()
             .chain(self.gate.deadline())
+            .chain(self.closing)
             .chain(self.opening.as_ref().map(|(at, _)| *at))
             .chain(
                 self.overlay
@@ -224,10 +277,11 @@ impl Driver {
         let action = self.gate.expire(now);
         self.gate_action(action, now)?;
         self.try_open(now)?;
+        self.try_close(now)?;
         if self.overlay.is_open() {
             self.decode(now)?;
             let effects = self.overlay.tick(now);
-            self.effects(effects)?;
+            self.effects(effects, now)?;
         }
         Ok(())
     }
@@ -240,3 +294,6 @@ impl Driver {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

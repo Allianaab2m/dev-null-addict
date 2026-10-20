@@ -48,6 +48,7 @@ pub struct App {
     /// Threads opened with Enter, innermost last. Esc closes the last one.
     threads: Vec<ThreadView>,
     popup: Option<Popup>,
+    moderation_notices: std::collections::VecDeque<String>,
     notice: Option<Notice>,
     me: Option<Username>,
     /// Commits the user sent that are still pending review.
@@ -94,6 +95,10 @@ pub enum Request {
     },
     Thread(CommitId),
     Replies {
+        id: CommitId,
+        cursor: Option<Cursor>,
+    },
+    NewestReplies {
         id: CommitId,
         cursor: Option<Cursor>,
     },
@@ -150,6 +155,7 @@ impl App {
             timeline: Timeline::new(log),
             threads: Vec::new(),
             popup: None,
+            moderation_notices: std::collections::VecDeque::new(),
             notice: None,
             me: None,
             pending: Vec::new(),
@@ -180,6 +186,7 @@ impl App {
     /// else the overlay. The toggle key always closes the overlay.
     pub fn input(&mut self, input: UiInput, now: Instant) -> Vec<Effect> {
         let effects = self.handle_input(input, now);
+        self.show_moderation_notice(now);
         self.sync_viewport();
         effects
     }
@@ -242,6 +249,7 @@ impl App {
         now: Instant,
     ) -> Vec<Effect> {
         let effects = self.handle_answer(request, result, now);
+        self.show_moderation_notice(now);
         self.sync_viewport();
         effects
     }
@@ -296,7 +304,8 @@ impl App {
                         self.backoff_until = Some(now + Duration::from_secs(60));
                         self.next_refresh = self.backoff_until;
                     }
-                    if error.code() == Some(crate::api::ErrorCode::CommitUnavailable)
+                    if (error.code() == Some(crate::api::ErrorCode::CommitUnavailable)
+                        || matches!(error, ApiError::Status { status, .. } if *status == reqwest::StatusCode::NOT_FOUND))
                         && let Request::Moderation(id) = request
                     {
                         self.pending.retain(|p| *p != id);
@@ -337,13 +346,29 @@ impl App {
                     }
                 }
             }
+            (Request::NewestReplies { id, cursor }, Response::Entries(page)) => {
+                let mut next = None;
+                for view in self.threads.iter_mut().filter(|v| v.id() == id) {
+                    next = view
+                        .replies_mut()
+                        .refresh_newest(page.clone(), cursor.is_none());
+                    view.reanchor();
+                }
+                if let Some(cursor) = next {
+                    return self.queue(vec![Request::NewestReplies {
+                        id,
+                        cursor: Some(cursor),
+                    }]);
+                }
+            }
             (Request::Create(_), Response::Commit(commit)) => {
                 self.compose.clear();
                 self.focus = Focus::Compose;
                 if commit.status == crate::api::CommitStatus::Pending {
                     self.pending.push(commit.id);
                 } else if commit.status == crate::api::CommitStatus::Rejected {
-                    self.popup = Some(Popup::toast("Your commit was rejected.", now));
+                    self.moderation_notices
+                        .push_back("Your commit was rejected.".into());
                 } else {
                     return self.refresh(now);
                 }
@@ -356,10 +381,8 @@ impl App {
                 }
                 crate::api::CommitStatus::Rejected => {
                     self.pending.retain(|p| *p != id);
-                    self.popup = Some(Popup::toast(
-                        format!("Commit {} was rejected.", thread.commit.short_hash),
-                        now,
-                    ));
+                    self.moderation_notices
+                        .push_back(format!("Commit {} was rejected.", thread.commit.short_hash));
                 }
             },
             (Request::Star { .. }, Response::Commit(commit)) => {
@@ -396,6 +419,7 @@ impl App {
         if !self.opened {
             return Vec::new();
         }
+        self.show_moderation_notice(now);
         if self.backoff_until.is_some_and(|t| t > now) {
             self.next_refresh = self.backoff_until;
             return Vec::new();
@@ -421,6 +445,15 @@ impl App {
 }
 
 impl App {
+    fn show_moderation_notice(&mut self, now: Instant) {
+        if self.opened
+            && self.popup.is_none()
+            && let Some(message) = self.moderation_notices.pop_front()
+        {
+            self.popup = Some(Popup::toast(message, now));
+        }
+    }
+
     fn queue(&mut self, requests: Vec<Request>) -> Vec<Effect> {
         if !self.opened {
             return Vec::new();
@@ -428,7 +461,8 @@ impl App {
         requests
             .into_iter()
             .filter_map(|request| {
-                if self.inflight.contains(&request) {
+                if self.inflight.iter().any(|inflight| inflight == &request || matches!((inflight, &request),
+                    (Request::NewestReplies { id: active, .. }, Request::NewestReplies { id, .. }) if active == id)) {
                     None
                 } else {
                     self.inflight.push(request.clone());
@@ -455,9 +489,16 @@ impl App {
         }
         if let Some(view) = self.threads.last() {
             requests.push(Request::Thread(view.id()));
-            requests.push(Request::Replies {
-                id: view.id(),
-                cursor: None,
+            requests.push(if view.replies().exhausted() {
+                Request::NewestReplies {
+                    id: view.id(),
+                    cursor: None,
+                }
+            } else {
+                Request::Replies {
+                    id: view.id(),
+                    cursor: None,
+                }
             });
         }
         requests.extend(self.pending.iter().copied().map(Request::Moderation));
