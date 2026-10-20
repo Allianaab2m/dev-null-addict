@@ -3,6 +3,8 @@
 //!
 //! Before starting the input thread, startup asks once for CPR (up to 100 ms),
 //! seeds the model when answered, and retains any typeahead without clearing.
+//! If unanswered, the common input path consumes the first late CPR for another
+//! two seconds. Its position is usable only before any shell output arrives.
 //!
 //! One loop on a current-thread tokio runtime waits on everything at once:
 //! input (read by a thread of its own, since reading stdin cannot be
@@ -192,9 +194,13 @@ pub async fn run(options: SessionOptions) -> Result<ShellExit, SessionError> {
         position,
         held: typeahead,
     } = startup::cursor(&mut driver.display).map_err(SessionError::Terminal)?;
+    let now = Instant::now();
     driver.seed_cursor(position);
+    if position.is_none() {
+        driver.expect_startup_reply(now);
+    }
     driver
-        .input(&typeahead, Instant::now())
+        .input(&typeahead, now)
         .map_err(SessionError::Terminal)?;
     let ShellProcess {
         mut output,

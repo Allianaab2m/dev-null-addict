@@ -157,11 +157,16 @@ You can get option list by passing `--help` to command arguments.
 ## Limits
 
 - dev-null-addict sees only the terminal it runs in, not other windows.
-- A lone Esc reaches the shell 10 ms later, while dev-null-addict waits to see
-  whether the toggle key follows in an escape sequence.
+- Outside the startup reply window, a lone Esc reaches the shell 10 ms later,
+  while dev-null-addict waits to see whether the toggle key follows in an
+  escape sequence.
 - Startup asks for the cursor position once, waiting up to 100 ms without
-  clearing existing output. If the terminal does not answer, the screen copy
-  starts unsynchronized.
+  clearing existing output. If the terminal does not answer, startup continues
+  immediately with an unsynchronized screen copy. For the next 2 seconds, the
+  first complete cursor reply is consumed, even while the overlay is open.
+  Its position is used only if no shell output has arrived yet. Partial replies
+  are held until complete or until that window ends. Keys with the same encoding,
+  such as xterm Shift+F3, can also be consumed once during this window.
 - What the shell prints while /dev/null is open is replayed when it closes.
   Past 4 MiB of it, the screen is redrawn instead, and the lines that
   scrolled off are not in the terminal's scrollback. Redraw restores both

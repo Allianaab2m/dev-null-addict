@@ -7,6 +7,7 @@ use crate::terminal::TermSize;
 use crate::ui::{App, Effect, Failure};
 
 use super::requests::{Answer, Requests};
+use super::startup::LateReply;
 use super::{Display, InputQueue, Overlay, SessionOptions};
 
 pub(super) struct Driver {
@@ -20,6 +21,8 @@ pub(super) struct Driver {
     gate: ToggleGate,
     opening: Option<(Instant, Vec<u8>)>,
     closing: Option<Instant>,
+    startup_reply: LateReply,
+    shell_output_seen: bool,
 }
 
 impl Driver {
@@ -42,6 +45,8 @@ impl Driver {
                 gate: ToggleGate::new(),
                 opening: None,
                 closing: None,
+                startup_reply: LateReply::default(),
+                shell_output_seen: false,
             },
             answers,
         ))
@@ -54,7 +59,22 @@ impl Driver {
         }
     }
 
+    pub fn expect_startup_reply(&mut self, now: Instant) {
+        self.startup_reply.expect(now);
+    }
+
     pub fn input(&mut self, bytes: &[u8], now: Instant) -> io::Result<()> {
+        if self.startup_reply.deadline().is_none() {
+            return self.route_input(bytes, now);
+        }
+        let filtered = self.startup_reply.filter(bytes, now);
+        if !self.shell_output_seen {
+            self.seed_cursor(filtered.position);
+        }
+        self.route_input(&filtered.held, now)
+    }
+
+    fn route_input(&mut self, bytes: &[u8], now: Instant) -> io::Result<()> {
         if self.closing.is_some() {
             self.queue.push(bytes);
         } else if let Some((_, held)) = &mut self.opening {
@@ -77,7 +97,7 @@ impl Driver {
                 let raw = match piece {
                     Scanned::Forward(raw) | Scanned::Toggle { raw, .. } => raw,
                 };
-                self.input(&raw, now)?;
+                self.route_input(&raw, now)?;
             } else {
                 let action = self.gate.handle(piece, now);
                 if let GateAction::Open(mut raw) = action {
@@ -97,7 +117,7 @@ impl Driver {
         }
         if self.opening.is_some() || self.overlay.is_open() {
             let held = self.scanner.take_held();
-            self.input(&held, now)?;
+            self.route_input(&held, now)?;
         }
         Ok(())
     }
@@ -151,6 +171,8 @@ impl Driver {
     }
 
     pub fn output(&mut self, bytes: &[u8], now: Instant) -> io::Result<()> {
+        // Even a partial hidden frame makes the startup position too old to apply.
+        self.shell_output_seen |= !bytes.is_empty();
         let mut frames = Vec::new();
         self.framer.push(bytes, self.overlay.is_open(), &mut frames);
         self.frames(frames)?;
@@ -232,7 +254,7 @@ impl Driver {
         let mut frames = Vec::new();
         self.framer.push(&[], false, &mut frames);
         self.frames(frames)?;
-        self.input(&rest, now)
+        self.route_input(&rest, now)
     }
 
     pub fn resize(&mut self, size: TermSize) -> io::Result<()> {
@@ -259,6 +281,7 @@ impl Driver {
             .deadline()
             .into_iter()
             .chain(self.gate.deadline())
+            .chain(self.startup_reply.deadline())
             .chain(self.closing)
             .chain(self.opening.as_ref().map(|(at, _)| *at))
             .chain(
@@ -271,6 +294,13 @@ impl Driver {
     }
 
     pub fn tick(&mut self, now: Instant) -> io::Result<()> {
+        if self
+            .startup_reply
+            .deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.input(&[], now)?;
+        }
         let mut pieces = Vec::new();
         self.scanner.expire(now, &mut pieces);
         self.scanned(pieces, now)?;

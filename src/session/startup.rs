@@ -1,3 +1,7 @@
+mod late_reply;
+
+pub(super) use late_reply::LateReply;
+
 use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;

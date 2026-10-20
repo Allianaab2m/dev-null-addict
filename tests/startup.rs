@@ -75,3 +75,54 @@ async fn startup_cpr_preserves_existing_terminal_and_seeds_background() {
     }
     result.expect("bounded CPR startup test");
 }
+
+// A reply delayed beyond startup must never reach a slowly starting shell,
+// where the PTY would echo it and the line editor would interpret ESC as a key.
+#[tokio::test(flavor = "current_thread")]
+async fn delayed_startup_cpr_does_not_leak_to_slow_shell() {
+    let (pty, pts) = pty_process::open().unwrap();
+    pty.resize(pty_process::Size::new(40, 120)).unwrap();
+    let mut child = pty_process::Command::new(env!("CARGO_BIN_EXE_dev-null-addict"))
+        .env_remove("NO_DEV_NULL_ADDICT")
+        .args([
+            "--toggle",
+            "ctrl+g",
+            "--shell",
+            "/bin/sh",
+            "--",
+            "-c",
+            "sleep 0.5; stty -echo; IFS= read -r line; printf 'INPUT:%s\\n' \"$line\"; exit 17",
+        ])
+        .kill_on_drop(true)
+        .spawn(pts)
+        .unwrap();
+    let (mut output, mut input) = pty.into_split();
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut query = [0; 4];
+        output.read_exact(&mut query).await.unwrap();
+        assert_eq!(&query, b"\x1b[6n");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        input.write_all(b"\x1b[39;1R").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        input.write_all(b"hello\n").await.unwrap();
+        let mut received = Vec::new();
+        let mut bytes = [0; 8192];
+        loop {
+            let n = output.read(&mut bytes).await.unwrap();
+            assert!(n > 0);
+            received.extend_from_slice(&bytes[..n]);
+            if received.windows(6).any(|part| part == b"INPUT:") && received.contains(&b'\n') {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&received);
+        assert!(!text.contains("39;1R"), "CPR leaked: {text:?}");
+        assert!(text.contains("INPUT:hello"), "input changed: {text:?}");
+        assert_eq!(child.wait().await.unwrap().code(), Some(17));
+    })
+    .await;
+    if result.is_err() {
+        let _ = child.kill().await;
+    }
+    result.expect("bounded delayed CPR test");
+}
