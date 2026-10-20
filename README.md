@@ -1,6 +1,11 @@
 # dev-null-addict
 
-[/dev/null](https://dev-null.sh) over your shell, one key away.
+<div align="center">
+  <p>
+    <a href="https://dev-null.sh">/dev/null</a> over your shell, one key away.
+  </p>
+  <img alt="Screen shot of dev-null-addict" src="dev-null-addict.png">
+</div>
 
 dev-null-addict runs your shell on a pseudo-terminal, as tmux does, and passes
 everything through. Press the toggle key and /dev/null opens in a window
