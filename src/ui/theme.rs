@@ -1,19 +1,36 @@
+use crate::api::Lane;
 use ratatui::style::{Color, Modifier, Style};
 
 pub(super) fn accent() -> Style {
     Style::default().fg(Color::Cyan)
 }
 
-/// A username, in the lane color its user picked, or the accent when there
-/// is none or it is not `#rrggbb`.
-pub(super) fn user(lane: Option<&str>) -> Style {
-    let rgb = lane
-        .and_then(|lane| lane.strip_prefix('#'))
-        .filter(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-        .and_then(|hex| u32::from_str_radix(hex, 16).ok());
+/// /dev/null's own lane colors, from its dark theme, which reads better on
+/// the dark backgrounds most terminals have.
+const LANES: [(u8, u8, u8); 6] = [
+    (0xff, 0x8a, 0x4c),
+    (0x51, 0xcf, 0x66),
+    (0xda, 0x77, 0xf2),
+    (0x3b, 0xc9, 0xdb),
+    (0xf0, 0x65, 0x95),
+    (0xfc, 0xc4, 0x19),
+];
+
+/// A username, in its lane color, or the accent when it has none, a picked
+/// one that is not `#rrggbb`, or a number past /dev/null's lanes.
+pub(super) fn user(lane: Option<&Lane>) -> Style {
+    let rgb = match lane {
+        Some(Lane::Picked(lane)) => lane
+            .strip_prefix('#')
+            .filter(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .map(|rgb| ((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)),
+        Some(Lane::Automatic(lane)) => LANES.get(usize::from(*lane)).copied(),
+        None => None,
+    };
     match rgb {
-        Some(rgb) => Style::default()
-            .fg(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
+        Some((r, g, b)) => Style::default()
+            .fg(Color::Rgb(r, g, b))
             .add_modifier(Modifier::BOLD),
         None => accent(),
     }
@@ -61,24 +78,24 @@ pub(super) fn background() -> Style {
 mod tests {
     use super::*;
 
-    // Only `#rrggbb` lanes color a username; anything else falls back to the accent.
+    // Picked `#rrggbb` lanes and numbered lanes color a username; anything else falls back to the accent.
     #[test]
     fn user_lane_colors() {
-        assert_eq!(
-            user(Some("#1A2b3c")),
+        let rgb = |r, g, b| {
             Style::default()
-                .fg(Color::Rgb(0x1a, 0x2b, 0x3c))
+                .fg(Color::Rgb(r, g, b))
                 .add_modifier(Modifier::BOLD)
+        };
+        assert_eq!(
+            user(Some(&Lane::Picked("#1A2b3c".into()))),
+            rgb(0x1a, 0x2b, 0x3c)
         );
-        for lane in [
-            None,
-            Some(""),
-            Some("1a2b3c"),
-            Some("#1a2b3"),
-            Some("#+1a2b3"),
-            Some("#1a2b3g"),
-        ] {
-            assert_eq!(user(lane), accent());
+        assert_eq!(user(Some(&Lane::Automatic(0))), rgb(0xff, 0x8a, 0x4c));
+        assert_eq!(user(Some(&Lane::Automatic(5))), rgb(0xfc, 0xc4, 0x19));
+        assert_eq!(user(Some(&Lane::Automatic(6))), accent());
+        assert_eq!(user(None), accent());
+        for lane in ["", "1a2b3c", "#1a2b3", "#+1a2b3", "#1a2b3g"] {
+            assert_eq!(user(Some(&Lane::Picked(lane.into()))), accent());
         }
     }
 }

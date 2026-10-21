@@ -14,7 +14,7 @@ pub(super) fn lines(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("@{}", commit.author.username),
-                    theme::user(commit.author.lane.as_deref()),
+                    theme::user(commit.author.lane.as_ref()),
                 ),
                 Span::styled(
                     format!(
