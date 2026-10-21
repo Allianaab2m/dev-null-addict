@@ -11,9 +11,19 @@ use super::{CommitId, Cursor, ShortHash, Username};
 pub struct User {
     pub username: Username,
     pub name: Option<String>,
-    /// The color the user picked on /dev/null, as `#rrggbb`.
-    #[serde(default)]
+    /// The color the user picked on /dev/null, as `#rrggbb`. /dev/null sends
+    /// a number for a user who picked none, which is left out.
+    #[serde(default, deserialize_with = "picked_lane")]
     pub lane: Option<String>,
+}
+
+fn picked_lane<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(lane) => Some(lane),
+        _ => None,
+    })
 }
 
 /// Where a commit is in moderation. Only the author sees their own commits
@@ -166,7 +176,7 @@ mod tests {
     use super::*;
     use crate::test_support::{commit_json, id};
 
-    // Signed resources omit optional counts, include extra fields and may contain deleted quoted commits.
+    // Signed resources omit optional counts, include extra fields and may contain deleted quoted commits; numeric lanes are not colors.
     #[test]
     fn upstream_resources_deserialize() {
         let deleted = serde_json::json!({"id": id(2), "parent_id": id(1), "deleted_at": "2026-10-21T00:00:00Z", "replies_count": 3});
@@ -189,6 +199,17 @@ mod tests {
             serde_json::from_value(serde_json::json!({"data": live, "ancestors": [deleted]}))
                 .unwrap();
         assert_eq!(thread.commit.id, id(1));
+        for (lane, expected) in [
+            (serde_json::json!("#719681"), Some("#719681")),
+            (serde_json::json!(5), None),
+            (serde_json::Value::Null, None),
+        ] {
+            let user: User = serde_json::from_value(
+                serde_json::json!({"username": "someone", "name": null, "lane": lane}),
+            )
+            .unwrap();
+            assert_eq!(user.lane.as_deref(), expected);
+        }
         assert_eq!(thread.ancestors[0].id(), id(2));
         let round_trip: Thread =
             serde_json::from_value(serde_json::to_value(&thread).unwrap()).unwrap();
