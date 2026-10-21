@@ -11,6 +11,9 @@ use super::{CommitId, Cursor, ShortHash, Username};
 pub struct User {
     pub username: Username,
     pub name: Option<String>,
+    /// The color the user picked on /dev/null, as `#rrggbb`.
+    #[serde(default)]
+    pub lane: Option<String>,
 }
 
 /// Where a commit is in moderation. Only the author sees their own commits

@@ -18,6 +18,7 @@ fn ready(app: &mut App, now: Instant) {
         Ok(Response::User(User {
             username: "someone".into(),
             name: None,
+            lane: None,
         })),
         now,
     );
